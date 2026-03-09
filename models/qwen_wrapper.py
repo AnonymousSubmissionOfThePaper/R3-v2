@@ -1,0 +1,528 @@
+"""Wrapper for Qwen3-VL-8B with optional LoRA and teacher model."""
+from __future__ import annotations
+
+import copy
+import os
+from dataclasses import dataclass
+import logging
+from typing import Any, Dict, List, Optional
+
+import torch
+from transformers import AutoModelForCausalLM, AutoProcessor
+
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - older transformers
+    AutoModelForVision2Seq = None
+
+
+def _patch_torch_autocast() -> None:
+    """Shim torch.is_autocast_enabled for older torch versions."""
+    try:
+        torch.is_autocast_enabled("cuda")
+        return
+    except TypeError:
+        pass
+    orig = torch.is_autocast_enabled
+
+    def _is_autocast_enabled(*args, **kwargs):
+        return orig()
+
+    torch.is_autocast_enabled = _is_autocast_enabled  # type: ignore[assignment]
+
+
+_patch_torch_autocast()
+
+
+@dataclass
+class QwenVLConfig:
+    """Configuration for Qwen VL wrapper."""
+    model_name: str = "Qwen/Qwen3-VL-8B-Instruct"
+    torch_dtype: str = "bf16"
+    device: str = "cuda"
+    use_teacher: bool = True
+    teacher_mode: str = "ema"  # "copy", "ema", "shared"
+    use_lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: Optional[List[str]] = None
+
+
+class QwenVLWrapper:
+    """Thin wrapper around Qwen3-VL for training and generation."""
+
+    def __init__(self, config: QwenVLConfig) -> None:
+        self.config = config
+        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        self._require_grads_hook = None
+        self.processor = AutoProcessor.from_pretrained(config.model_name, trust_remote_code=True)
+        if hasattr(self.processor, "tokenizer") and self.processor.tokenizer is not None:
+            tokenizer = self.processor.tokenizer
+            tokenizer.padding_side = "left"
+            if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+        dtype = self._resolve_dtype(config.torch_dtype)
+        self.model_dtype = dtype
+        self.model = self._load_model(config.model_name, dtype)
+        if hasattr(self.model.config, "pad_token_id") and hasattr(self.processor, "tokenizer"):
+            pad_id = self.processor.tokenizer.pad_token_id
+            if pad_id is not None and self.model.config.pad_token_id is None:
+                self.model.config.pad_token_id = pad_id
+        self.model.to(self.device, dtype=dtype)
+        self.model.train()
+
+        if config.use_lora:
+            self._apply_lora()
+            self.model.to(self.device, dtype=dtype)
+
+        self.teacher = None
+        self.teacher_mode = config.teacher_mode
+        if config.use_teacher and config.teacher_mode == "copy":
+            self.teacher = copy.deepcopy(self.model)
+            self.teacher.requires_grad_(False)
+            self.teacher.eval()
+        self._context_margin_tokens = 8
+
+    @property
+    def tokenizer(self):
+        return self.processor.tokenizer
+
+    def _apply_lora(self) -> None:
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError as exc:
+            raise RuntimeError("peft is required for LoRA training.") from exc
+        target_modules = self.config.lora_target_modules or [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+        ]
+        lora_cfg = LoraConfig(
+            r=self.config.lora_r,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        self.model = get_peft_model(self.model, lora_cfg)
+        self.model.print_trainable_parameters()
+
+    def load_lora_adapter(self, adapter_dir: str) -> bool:
+        """Load LoRA adapter weights from a checkpoint directory."""
+        if not self.config.use_lora:
+            logging.warning("LoRA is disabled; skipping adapter load.")
+            return False
+        safetensors_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+        bin_path = os.path.join(adapter_dir, "adapter_model.bin")
+        state = None
+        if os.path.exists(safetensors_path):
+            try:
+                from safetensors.torch import load_file  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError("safetensors is required to load LoRA adapter.") from exc
+            state = load_file(safetensors_path)
+        elif os.path.exists(bin_path):
+            state = torch.load(bin_path, map_location="cpu")
+        else:
+            logging.warning("No LoRA adapter found in %s", adapter_dir)
+            return False
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        if missing:
+            logging.info("LoRA load missing keys: %s", missing)
+        if unexpected:
+            logging.info("LoRA load unexpected keys: %s", unexpected)
+        if self.teacher is not None:
+            self.teacher.load_state_dict(self.model.state_dict(), strict=False)
+        return True
+
+    def _get_input_embeddings(self) -> Optional[torch.nn.Module]:
+        try:
+            return self.model.get_input_embeddings()
+        except Exception:
+            pass
+        for attr in ("language_model", "model", "llm", "text_model", "decoder"):
+            module = getattr(self.model, attr, None)
+            if module is None:
+                continue
+            if hasattr(module, "get_input_embeddings"):
+                try:
+                    return module.get_input_embeddings()
+                except Exception:
+                    continue
+        return None
+
+    def enable_input_require_grads(self) -> bool:
+        emb = self._get_input_embeddings()
+        if emb is None:
+            logging.warning("Could not locate input embeddings for gradient checkpointing.")
+            return False
+
+        def _make_inputs_require_grads(module, inputs, output):
+            if torch.is_tensor(output):
+                output.requires_grad_(True)
+            elif isinstance(output, (tuple, list)):
+                for out in output:
+                    if torch.is_tensor(out):
+                        out.requires_grad_(True)
+
+        self._require_grads_hook = emb.register_forward_hook(_make_inputs_require_grads)
+        return True
+
+    def _load_model(self, model_name: str, dtype: torch.dtype) -> torch.nn.Module:
+        load_errors = []
+        if AutoModelForVision2Seq is not None:
+            try:
+                return AutoModelForVision2Seq.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - surfacing error detail
+                load_errors.append(f"AutoModelForVision2Seq: {exc}")
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfacing error detail
+            load_errors.append(f"AutoModelForCausalLM: {exc}")
+        try:
+            from transformers import AutoModel
+
+            return AutoModel.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfacing error detail
+            load_errors.append(f"AutoModel: {exc}")
+        raise RuntimeError(
+            "Failed to load model with AutoModelForVision2Seq/AutoModelForCausalLM/AutoModel. "
+            + " | ".join(load_errors)
+        )
+
+    @staticmethod
+    def _resolve_dtype(dtype_str: str) -> torch.dtype:
+        if dtype_str == "fp16":
+            return torch.float16
+        if dtype_str == "bf16":
+            return torch.bfloat16
+        return torch.float32
+
+    def _build_user_text(self, question: str, pseudo_text: Optional[str]) -> str:
+        if pseudo_text:
+            return f"{question}\nContext: {pseudo_text}"
+        return question
+
+    def _build_messages(
+        self, question: str, pseudo_text: Optional[str], answer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        content = [
+            {"type": "image"},
+            {"type": "text", "text": self._build_user_text(question, pseudo_text)},
+        ]
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": content}]
+        if answer is not None:
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": answer}]}
+            )
+        return messages
+
+    def _count_tokens(self, text: str) -> int:
+        tokenizer = self.processor.tokenizer
+        return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def _truncate_pseudo_texts(
+        self,
+        questions: List[str],
+        pseudo_texts: List[str],
+        answers: List[str],
+        max_length: Optional[int],
+    ) -> List[str]:
+        if not max_length:
+            return pseudo_texts
+        if not hasattr(self.processor, "apply_chat_template"):
+            return pseudo_texts
+        tokenizer = self.processor.tokenizer
+        truncated: List[str] = []
+        margin = self._context_margin_tokens
+        for question, pseudo_text, answer in zip(questions, pseudo_texts, answers):
+            if not pseudo_text:
+                truncated.append(pseudo_text)
+                continue
+            base_full = self.processor.apply_chat_template(
+                self._build_messages(question, "", answer),
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            base_len = self._count_tokens(base_full)
+            max_ctx_tokens = max_length - base_len - margin
+            if max_ctx_tokens <= 0:
+                truncated.append("")
+                continue
+            ctx_ids = tokenizer(pseudo_text, add_special_tokens=False)["input_ids"]
+            if len(ctx_ids) > max_ctx_tokens:
+                ctx_ids = ctx_ids[:max_ctx_tokens]
+                pseudo_text = tokenizer.decode(ctx_ids, skip_special_tokens=True)
+            full_text = self.processor.apply_chat_template(
+                self._build_messages(question, pseudo_text, answer),
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            if self._count_tokens(full_text) > max_length:
+                pseudo_text = ""
+            truncated.append(pseudo_text)
+        return truncated
+
+    def build_prompt(self, question: str, pseudo_text: Optional[str] = None) -> str:
+        """Build a prompt with image placeholder and optional pseudo-text."""
+        if hasattr(self.processor, "apply_chat_template"):
+            messages = self._build_messages(question, pseudo_text)
+            return self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        context = f"Context: {pseudo_text}\n" if pseudo_text else ""
+        return f"<image>\nQuestion: {question}\n{context}Answer:"
+
+    def _build_labels(
+        self, prompt_texts: List[str], full_texts: List[str], max_length: Optional[int]
+    ) -> torch.Tensor:
+        tokenizer = self.processor.tokenizer
+        prompt_ids = tokenizer(
+            prompt_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )["input_ids"]
+        full_ids = tokenizer(
+            full_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )["input_ids"]
+        labels = full_ids.clone()
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        for i in range(labels.size(0)):
+            prompt_len = (prompt_ids[i] != pad_id).sum().item()
+            labels[i, :prompt_len] = -100
+        return labels
+
+    def encode_inputs(
+        self,
+        images: List[Any],
+        questions: List[str],
+        pseudo_texts: Optional[List[str]] = None,
+        answers: Optional[List[str]] = None,
+        max_length: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        pseudo_texts = pseudo_texts or [""] * len(questions)
+        if answers is not None:
+            pseudo_texts = self._truncate_pseudo_texts(
+                questions,
+                pseudo_texts,
+                answers,
+                max_length,
+            )
+        prompts: List[str] = []
+        full_texts: List[str] = []
+        if hasattr(self.processor, "apply_chat_template"):
+            for q, p, a in zip(questions, pseudo_texts, answers or [None] * len(questions)):
+                prompt = self.processor.apply_chat_template(
+                    self._build_messages(q, p),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                prompts.append(prompt)
+                if answers is not None:
+                    full_texts.append(
+                        self.processor.apply_chat_template(
+                            self._build_messages(q, p, a),
+                            tokenize=False,
+                            add_generation_prompt=False,
+                        )
+                    )
+            if answers is None:
+                full_texts = prompts
+        else:
+            prompts = [self.build_prompt(q, p) for q, p in zip(questions, pseudo_texts)]
+            if answers is not None:
+                full_texts = [f"{p} {a}" for p, a in zip(prompts, answers)]
+            else:
+                full_texts = prompts
+
+        inputs = self.processor(
+            images=images,
+            text=full_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        if answers is not None:
+            if hasattr(self.processor, "apply_chat_template"):
+                labels = inputs["input_ids"].clone()
+                prompt_ids = self.processor(
+                    images=images,
+                    text=prompts,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors="pt",
+                )["input_ids"]
+                pad_id = self.processor.tokenizer.pad_token_id or 0
+                for i in range(labels.size(0)):
+                    prompt_len = (prompt_ids[i] != pad_id).sum().item()
+                    labels[i, :prompt_len] = -100
+                inputs["labels"] = labels
+            else:
+                labels = self._build_labels(prompts, full_texts, max_length=max_length)
+                inputs["labels"] = labels
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        return inputs
+
+    def forward_student(
+        self,
+        images: List[Any],
+        questions: List[str],
+        pseudo_texts: Optional[List[str]] = None,
+        answers: Optional[List[str]] = None,
+        max_length: Optional[int] = None,
+        prefix_embeds: Optional[torch.Tensor] = None,
+        use_soft_prefix: bool = False,
+    ) -> Any:
+        inputs = self.encode_inputs(images, questions, pseudo_texts, answers, max_length)
+        if use_soft_prefix and prefix_embeds is not None:
+            input_ids = inputs.pop("input_ids")
+            attention_mask = inputs.pop("attention_mask")
+            token_embeds = self.model.get_input_embeddings()(input_ids)
+            prefix_embeds = prefix_embeds.to(token_embeds.dtype).to(token_embeds.device)
+            inputs_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
+            prefix_mask = torch.ones(
+                (attention_mask.size(0), prefix_embeds.size(1)),
+                device=attention_mask.device,
+                dtype=attention_mask.dtype,
+            )
+            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+            labels = inputs.get("labels")
+            if labels is not None:
+                prefix_ignore = torch.full(
+                    (labels.size(0), prefix_embeds.size(1)),
+                    -100,
+                    device=labels.device,
+                    dtype=labels.dtype,
+                )
+                labels = torch.cat([prefix_ignore, labels], dim=1)
+                inputs["labels"] = labels
+            outputs = self.model(
+                inputs_embeds=inputs_embeds, attention_mask=attention_mask, **inputs
+            )
+            if "labels" in inputs:
+                outputs.labels = inputs["labels"]
+            return outputs
+        outputs = self.model(**inputs)
+        if "labels" in inputs:
+            outputs.labels = inputs["labels"]
+        return outputs
+
+    def forward_teacher(
+        self,
+        images: List[Any],
+        questions: List[str],
+        pseudo_texts: Optional[List[str]] = None,
+        answers: Optional[List[str]] = None,
+        max_length: Optional[int] = None,
+    ) -> Any:
+        if self.teacher is None:
+            if self.teacher_mode == "shared":
+                inputs = self.encode_inputs(
+                    images,
+                    questions,
+                    pseudo_texts=pseudo_texts,
+                    answers=answers,
+                    max_length=max_length,
+                )
+                with torch.no_grad():
+                    return self.model(**inputs)
+            raise RuntimeError("Teacher model is disabled. Set use_teacher=True to enable it.")
+        inputs = self.encode_inputs(images, questions, pseudo_texts, answers, max_length)
+        with torch.no_grad():
+            return self.teacher(**inputs)
+
+    def generate_answer(
+        self,
+        images: List[Any],
+        questions: List[str],
+        pseudo_texts: Optional[List[str]] = None,
+        max_new_tokens: int = 64,
+        return_prompts: bool = False,
+        prefix_embeds: Optional[torch.Tensor] = None,
+        use_soft_prefix: bool = False,
+        answer_only: bool = False,
+    ) -> Any:
+        pseudo_texts = pseudo_texts or [""] * len(questions)
+        if answer_only:
+            questions = [f"{q}\nAnswer with a short phrase only." for q in questions]
+        prompts = [self.build_prompt(q, p) for q, p in zip(questions, pseudo_texts)]
+        inputs = self.processor(
+            images=images,
+            text=prompts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        if use_soft_prefix and prefix_embeds is not None:
+            input_ids = inputs.pop("input_ids")
+            attention_mask = inputs.pop("attention_mask")
+            token_embeds = self.model.get_input_embeddings()(input_ids)
+            prefix_embeds = prefix_embeds.to(token_embeds.dtype).to(token_embeds.device)
+            inputs_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
+            prefix_mask = torch.ones(
+                (attention_mask.size(0), prefix_embeds.size(1)),
+                device=attention_mask.device,
+                dtype=attention_mask.dtype,
+            )
+            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                )
+        else:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                )
+        decoded = self.processor.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        answers = []
+        for prompt, text in zip(prompts, decoded):
+            cleaned = text.strip()
+            if cleaned.startswith(prompt):
+                cleaned = cleaned[len(prompt) :].strip()
+            elif "Answer:" in cleaned:
+                cleaned = cleaned.split("Answer:", 1)[-1].strip()
+            else:
+                lowered = cleaned.lower()
+                marker = None
+                for tag in ("assistant", "assistant:", "\nassistant"):
+                    pos = lowered.rfind(tag)
+                    if pos != -1:
+                        marker = pos + len(tag)
+                        break
+                if marker is not None:
+                    cleaned = cleaned[marker:].strip()
+            answers.append(cleaned)
+        if return_prompts:
+            return answers, prompts
+        return answers
